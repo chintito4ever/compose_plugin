@@ -1275,6 +1275,10 @@ switch ($_POST['action']) {
 
         echo json_encode(['result' => 'success', 'labelsViewMode' => $labelsViewMode]);
         break;
+    case 'getOnePasswordStatus':
+        // State and labels only: the token and secret values are never read here.
+        echo json_encode(['result' => 'success'] + OnePassword::status());
+        break;
     case 'previewComposeArgs':
         $script = getPostScript();
         if (!$script) {

@@ -208,6 +208,19 @@ start_stack() {
     if [ -n "$COMPOSE_SPEC_CREDENTIAL_ID" ]; then
         cmd_args+=(--credential-id "$COMPOSE_SPEC_CREDENTIAL_ID")
     fi
+    if [ "$COMPOSE_SPEC_OP_MANAGED" = "true" ]; then
+        if [ -n "$COMPOSE_SPEC_OP_BLOCKER" ]; then
+            log "WARNING: Stack '$stack_name' uses 1Password secrets in a configuration that cannot be deployed: $COMPOSE_SPEC_OP_BLOCKER" warning
+        fi
+        if [ -n "$COMPOSE_SPEC_OP_ENV_FILE" ]; then
+            cmd_args+=(--op-env-file "$COMPOSE_SPEC_OP_ENV_FILE")
+        else
+            cmd_args+=(--op-managed)
+        fi
+    fi
+    # When 1Password secrets cannot be resolved (e.g. locked after reboot),
+    # start existing containers instead of recreating them with op:// values.
+    cmd_args+=(--op-locked-start-existing)
     for profile in "${COMPOSE_SPEC_PROFILES[@]}"; do
         cmd_args+=(-g "$profile")
     done

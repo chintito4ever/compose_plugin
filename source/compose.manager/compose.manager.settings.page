@@ -2653,10 +2653,15 @@ $acePath = file_exists('/usr/local/emhttp/plugins/dynamix/javascript/ace/ace.js'
 
             var idx = 0;
             var completed = 0;
+            var onePasswordSkipped = 0;
 
             function runNext() {
                 if (idx >= paths.length) {
-                    showUpdatesStatus('Auto-update completed for ' + completed + ' stack(s).', 'success');
+                    var summary = 'Auto-update completed for ' + completed + ' stack(s).';
+                    if (onePasswordSkipped > 0) {
+                        summary += ' ' + onePasswordSkipped + ' stack(s) using 1Password secrets were skipped; unlock 1Password with op-unlock first.';
+                    }
+                    showUpdatesStatus(summary, onePasswordSkipped > 0 ? 'error' : 'success');
                     return;
                 }
                 var p = paths[idx++];
@@ -2666,7 +2671,10 @@ $acePath = file_exists('/usr/local/emhttp/plugins/dynamix/javascript/ace/ace.js'
                 }, function(data) {
                     completed++;
                     runNext();
-                }, 'json').fail(function() {
+                }, 'json').fail(function(xhr) {
+                    if (xhr && xhr.responseJSON && xhr.responseJSON.errorCode === 'onepassword') {
+                        onePasswordSkipped++;
+                    }
                     if (typeof composeLogger === 'function') {
                         composeLogger('runNow failed for path', { path: p }, 'user', 'warn', 'settings');
                     }

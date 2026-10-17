@@ -209,6 +209,9 @@ resolve_stack_env_file() {
 #   COMPOSE_SPEC_USE_DEFAULT_FILE_DISCOVERY
 #   COMPOSE_SPEC_ENV_FILE_PATH
 #   COMPOSE_SPEC_CREDENTIAL_ID
+#   COMPOSE_SPEC_OP_MANAGED ("true" when up/update would consume 1Password references)
+#   COMPOSE_SPEC_OP_ENV_FILE (env file holding the references, when deployable)
+#   COMPOSE_SPEC_OP_BLOCKER (why the 1Password configuration cannot be deployed, if any)
 #   COMPOSE_SPEC_COMPOSE_FILES (array)
 #   COMPOSE_SPEC_PROFILES (array)
 #
@@ -276,6 +279,12 @@ load_compose_action_spec() {
     # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
     COMPOSE_SPEC_ENV_FILE_PATH=""
     COMPOSE_SPEC_CREDENTIAL_ID=""
+    # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
+    COMPOSE_SPEC_OP_MANAGED="false"
+    # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
+    COMPOSE_SPEC_OP_ENV_FILE=""
+    # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
+    COMPOSE_SPEC_OP_BLOCKER=""
     COMPOSE_SPEC_ERROR_MESSAGE=""
     COMPOSE_SPEC_COMPOSE_FILES=()
     COMPOSE_SPEC_PROFILES=()
@@ -310,6 +319,18 @@ load_compose_action_spec() {
                 # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
                 COMPOSE_SPEC_CREDENTIAL_ID="$value"
                 ;;
+            onePassword)
+                # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
+                COMPOSE_SPEC_OP_MANAGED="$value"
+                ;;
+            onePasswordEnvFile)
+                # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
+                COMPOSE_SPEC_OP_ENV_FILE="$value"
+                ;;
+            onePasswordBlocker)
+                # shellcheck disable=SC2034  # Populated here, consumed by scripts that source common.sh.
+                COMPOSE_SPEC_OP_BLOCKER="$value"
+                ;;
             composeFile)
                 COMPOSE_SPEC_COMPOSE_FILES+=("$value")
                 ;;
@@ -342,4 +363,55 @@ load_compose_action_spec() {
     fi
 
     return 0
+}
+
+# ------------------------------------------------------------
+# 1Password integration
+# ------------------------------------------------------------
+
+# Exit code used when an operation is blocked to protect 1Password secrets.
+# shellcheck disable=SC2034  # Consumed by scripts that source common.sh.
+ONEPASSWORD_BLOCKED_EXIT=78
+
+# Print each existing file among the arguments that holds an op:// reference
+# outside a full-line comment. Only paths are printed, never file contents.
+onepassword_reference_files() {
+    local file
+    for file in "$@"; do
+        if [ -n "$file" ] && [ -f "$file" ] && grep -Eq '^[[:space:]]*[^#[:space:]].*op://' "$file" 2>/dev/null; then
+            printf '%s\n' "$file"
+        fi
+    done
+}
+
+# Offline 1Password state: unavailable | locked | unlocked.
+# The token file is only tested for presence; it is never read.
+onepassword_state() {
+    local op_secure="${COMPOSE_OP_SECURE_BIN:-/usr/local/bin/op-secure}"
+    local token_file="${COMPOSE_OP_TOKEN_FILE:-/run/1password/service-account-token}"
+    if [ ! -x "$op_secure" ]; then
+        echo "unavailable"
+    elif [ ! -s "$token_file" ]; then
+        echo "locked"
+    else
+        echo "unlocked"
+    fi
+}
+
+# User-facing message for a 1Password block reason (kept in sync with OnePassword.php).
+onepassword_message() {
+    case "$1" in
+        unavailable)
+            echo "This project uses 1Password secrets, but the 1Password CLI helpers were not found. Install the 1Password CLI and the op-secure helper (/usr/local/bin/op-secure) on Unraid, then run op-unlock before deploying."
+            ;;
+        locked)
+            echo "This project uses 1Password secrets. Unlock 1Password on Unraid using op-unlock before deploying."
+            ;;
+        unsupported)
+            echo "This project uses 1Password secrets, but its configuration cannot be deployed safely (op:// references outside the project env file, an invalid reference, or a service env_file). Open the stack in Compose Manager to see the reason."
+            ;;
+        *)
+            echo "This project uses 1Password secrets. Deploying it from Compose Manager is blocked so unresolved op:// references are never passed to containers. Running containers were not changed."
+            ;;
+    esac
 }

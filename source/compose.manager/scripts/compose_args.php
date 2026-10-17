@@ -34,6 +34,10 @@ function emitSuccess(array $data, string $format): void
         echo "useDefaultFileDiscovery\t" . ((($data['useDefaultFileDiscovery'] ?? false) ? 'true' : 'false')) . "\n";
         echo "envFilePath\t" . ($data['envFilePath'] ?? '') . "\n";
         echo "credentialId\t" . ($data['credentialId'] ?? '') . "\n";
+        $onePassword = $data['onePassword'] ?? [];
+        echo "onePassword\t" . (!empty($onePassword['managed']) ? 'true' : 'false') . "\n";
+        echo "onePasswordEnvFile\t" . tsvField((string) ($onePassword['envFile'] ?? '')) . "\n";
+        echo "onePasswordBlocker\t" . tsvField((string) ($onePassword['blocker'] ?? '')) . "\n";
         foreach (($data['composeFiles'] ?? []) as $filePath) {
             echo "composeFile\t" . $filePath . "\n";
         }
@@ -44,6 +48,14 @@ function emitSuccess(array $data, string $format): void
     }
 
     echo json_encode(['result' => 'success', 'data' => $data], JSON_UNESCAPED_SLASHES) . PHP_EOL;
+}
+
+/**
+ * Keep a TSV value on one line.
+ */
+function tsvField(string $value): string
+{
+    return str_replace(["\t", "\r", "\n"], ' ', $value);
 }
 
 function emitError(string $message, string $format): void

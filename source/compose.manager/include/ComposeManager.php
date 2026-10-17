@@ -38,6 +38,9 @@ $hideComposeFromDocker = ($cfg['HIDE_COMPOSE_FROM_DOCKER'] ?? 'false') === 'true
 // Get Docker Compose CLI version
 $composeVersion = trim(shell_exec('docker compose version --short 2>/dev/null') ?? '');
 
+// 1Password status (token presence only; op-status results are cached briefly).
+$composeOnePasswordStatus = OnePassword::status();
+
 // Host total memory in bytes for stack-level memory denominator.
 $composeSystemMemBytes = 0;
 $memKbRaw = trim(shell_exec("awk '/^MemTotal:/ {print \$2}' /proc/meminfo 2>/dev/null") ?? '');
@@ -329,6 +332,37 @@ if ($cpuCount <= 0) {
         position: relative;
         z-index: 1;
     }
+    .compose-op-indicator {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 0 5px;
+        font-size: 0.75em;
+        line-height: 1.5;
+        vertical-align: middle;
+        white-space: nowrap;
+        border: 1px solid currentColor;
+        border-radius: 3px;
+        opacity: 0.7;
+        cursor: default;
+    }
+
+    .compose-op-indicator .fa,
+    .compose-op-status .fa {
+        margin-right: 2px;
+    }
+
+    .compose-op-status {
+        margin-left: 20px;
+        vertical-align: middle;
+        white-space: nowrap;
+        opacity: 0.8;
+        cursor: default;
+    }
+
+    .compose-op-status[data-state='locked'] .compose-op-status-label,
+    .compose-op-status[data-state='error'] .compose-op-status-label {
+        font-weight: bold;
+    }
 </style>
 
 <?php
@@ -450,6 +484,9 @@ $acePath = file_exists('/usr/local/emhttp/plugins/dynamix/javascript/ace/ace.js'
             <span style='vertical-align:middle;'>Autostart only</span>
         </label>
         <a href='/Settings/compose.manager.settings' style='margin-left:20px;'><input type='button' value='Settings'></a>
+        <span id='compose-op-status' class='compose-op-status' data-state='<?php echo htmlspecialchars($composeOnePasswordStatus['state'], ENT_QUOTES, 'UTF-8'); ?>' title='<?php echo htmlspecialchars($composeOnePasswordStatus['detail'], ENT_QUOTES, 'UTF-8'); ?>'<?php echo $composeOnePasswordStatus['state'] === OnePassword::STATE_UNAVAILABLE ? ' hidden' : ''; ?>>
+            <i class='fa fa-key' aria-hidden='true'></i> 1Password: <span class='compose-op-status-label'><?php echo htmlspecialchars($composeOnePasswordStatus['label'], ENT_QUOTES, 'UTF-8'); ?></span>
+        </span>
     </span><br>
 
     <!-- Stack Actions Modal -->

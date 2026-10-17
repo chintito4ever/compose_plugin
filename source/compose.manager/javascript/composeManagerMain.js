@@ -604,6 +604,7 @@ function composeLoadlist() {
 
             // Initialize UI components for the newly loaded content
             initStackListUI();
+            composeRefreshOnePasswordStatus();
 
             // Debug: log initial per-stack rendered status icons (data-status attribute)
             try {
@@ -4193,6 +4194,37 @@ function composeHandleIdentityError(info) {
     swal('Compose project identity required', message, 'warning');
 }
 
+// A compose action was refused because the stack uses 1Password secrets that
+// cannot be resolved right now (locked, CLI missing, or unsupported config).
+function composeHandleOnePasswordError(info) {
+    var message = (info && info.message)
+        ? String(info.message)
+        : 'This project uses 1Password secrets. Unlock 1Password on Unraid using op-unlock before deploying.';
+    swal('1Password secrets required', message, 'warning');
+    composeRefreshOnePasswordStatus();
+}
+
+// Refresh the global "1Password: ..." indicator. Cheap: the server only checks
+// whether the RAM token file is present (op-status results are cached).
+function composeRefreshOnePasswordStatus() {
+    var $status = $('#compose-op-status');
+    if ($status.length === 0) {
+        return;
+    }
+    var usedByStacks = $('#compose_stacks tr.compose-sortable[data-onepassword="1"]').length > 0;
+    $.post(caURL, { action: 'getOnePasswordStatus' }, function (data) {
+        var parsed = tryParseJson(data);
+        if (!parsed || parsed.result !== 'success' || !parsed.state) {
+            return;
+        }
+        $status.attr('data-state', parsed.state);
+        $status.attr('title', parsed.detail || '');
+        $status.find('.compose-op-status-label').text(parsed.label || parsed.state);
+        // Hide only when the CLI is missing and no stack needs it.
+        $status.prop('hidden', parsed.state === 'unavailable' && !usedByStacks);
+    });
+}
+
 $(document).on('click', '.compose-identity-warning', function (event) {
     event.stopPropagation();
     var $row = $(this).closest('tr.compose-sortable');
@@ -4271,6 +4303,16 @@ function performComposeAction(opts) {
             composeHandleIdentityError(parsed);
             if (typeof onComplete === 'function') {
                 onComplete(parsed, data);
+            }
+            return;
+        }
+        if (parsed && parsed.error === 'onepassword') {
+            if (stackName) {
+                setStackActionInProgress(stackName, false);
+            }
+            composeHandleOnePasswordError(parsed);
+            if (typeof onComplete === 'function') {
+                onComplete(null, null);
             }
             return;
         }
@@ -4984,6 +5026,13 @@ function executeStartAllStacks(opts) {
         removeOrphans: removeOrphans ? 1 : 0
     }, function(data) {
         var parsed = tryParseJson(data);
+        if (parsed && parsed.error === 'onepassword') {
+            stacks.forEach(function(s) {
+                setStackActionInProgress(s.project, false);
+            });
+            composeHandleOnePasswordError(parsed);
+            return;
+        }
         if (parsed && parsed.background) {
             notifyBackgroundStarted('Start All Stacks', !suppressBackgroundNotification);
             stacks.forEach(function(s) {

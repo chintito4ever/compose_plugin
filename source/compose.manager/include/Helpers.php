@@ -175,6 +175,55 @@ function appendComposeEnvFileArg(array &$composeCommand, array $args): void
     }
 }
 
+/**
+ * 1Password gate for a compose action on a stack.
+ *
+ * Only up/update create or recreate containers; every other action is
+ * allowed unchanged so logs, stop, down and pull keep working while
+ * 1Password is locked.
+ *
+ * @return array{allowed: bool, managed: bool, reason: ?string, message: ?string, envFile: ?string}
+ */
+function composeOnePasswordGate(StackInfo $stackInfo, string $action): array
+{
+    if (!in_array($action, ['up', 'update'], true)) {
+        return ['allowed' => true, 'managed' => false, 'reason' => null, 'message' => null, 'envFile' => null];
+    }
+    return OnePassword::deploymentGate($stackInfo->getOnePasswordDetection());
+}
+
+/**
+ * Tell compose.sh which env file holds the stack's 1Password references.
+ *
+ * @param array<int, string> $composeCommand
+ * @param array<string, mixed> $opGate Result of composeOnePasswordGate()
+ */
+function appendComposeOnePasswordArgs(array &$composeCommand, array $opGate): void
+{
+    if (empty($opGate['managed'])) {
+        return;
+    }
+    $envFile = (string) ($opGate['envFile'] ?? '');
+    if ($envFile !== '') {
+        $composeCommand[] = '--op-env-file';
+        $composeCommand[] = $envFile;
+    } else {
+        $composeCommand[] = '--op-managed';
+    }
+}
+
+/**
+ * @param array<string, string> $opBlockedStacks Stack name => reason
+ */
+function composeOnePasswordSkippedSummary(array $opBlockedStacks): string
+{
+    $lines = [];
+    foreach ($opBlockedStacks as $stack => $message) {
+        $lines[] = $stack . ': ' . $message;
+    }
+    return 'Skipped because the project uses 1Password secrets. ' . implode(' ', $lines);
+}
+
 function resolveStackWaitSettings(string $stackPath, array $cfg): array
 {
     $stackName = basename($stackPath);
@@ -307,6 +356,25 @@ function echoComposeCommand($action, array $options = [])
             return;
         }
 
+        // Never let up/update reach Docker with unresolved 1Password references.
+        $opGate = composeOnePasswordGate($stackInfo, $action);
+        if (!$opGate['allowed']) {
+            composeLogger(
+                "Blocked '$action' for '{$stackInfo->projectFolder}': project uses 1Password secrets ({$opGate['reason']})",
+                ['action' => $action, 'path' => $path],
+                'user',
+                'warning',
+                'onepassword'
+            );
+            echo json_encode([
+                'error' => 'onepassword',
+                'reason' => $opGate['reason'],
+                'project' => $stackInfo->projectFolder,
+                'message' => $opGate['message'],
+            ]);
+            return;
+        }
+
         $args = $stackInfo->buildComposeArgs();
 
         $composeCommand[] = "-c" . $action;
@@ -323,6 +391,7 @@ function echoComposeCommand($action, array $options = [])
         }
 
         appendComposeEnvFileArg($composeCommand, $args);
+        appendComposeOnePasswordArgs($composeCommand, $opGate);
 
         if (in_array($action, ['up', 'update', 'pull'], true)) {
             $credentialId = trim((string) ($stackInfo->getCredentialId() ?? ''));
@@ -442,6 +511,7 @@ function echoComposeCommandMultiple($action, array $options = [])
     $commands = array();
     $stackNames = array();
     $blockedStacks = array();
+    $opBlockedStacks = array();
 
     foreach ($paths as $path) {
         composeLogger("Processing stack for multi-compose action: " . $path, ['path' => $path, 'action' => $action], 'user', 'debug', 'compose-multi');
@@ -470,6 +540,19 @@ function echoComposeCommandMultiple($action, array $options = [])
             continue;
         }
 
+        $opGate = composeOnePasswordGate($stackInfo, $action);
+        if (!$opGate['allowed']) {
+            composeLogger(
+                "Skipping '{$stackInfo->projectFolder}' during multi-compose action: project uses 1Password secrets ({$opGate['reason']})",
+                ['action' => $action, 'path' => $path],
+                'user',
+                'warning',
+                'onepassword'
+            );
+            $opBlockedStacks[$stackInfo->getName()] = (string) $opGate['message'];
+            continue;
+        }
+
         $stackNames[] = $stackInfo->getName();
         $args = $stackInfo->buildComposeArgs();
 
@@ -487,6 +570,7 @@ function echoComposeCommandMultiple($action, array $options = [])
         }
 
         appendComposeEnvFileArg($composeCommand, $args);
+        appendComposeOnePasswordArgs($composeCommand, $opGate);
 
         if (in_array($action, ['up', 'update', 'pull'], true)) {
             $credentialId = trim((string) ($stackInfo->getCredentialId() ?? ''));
@@ -531,7 +615,16 @@ function echoComposeCommandMultiple($action, array $options = [])
     }
 
     if (empty($commands)) {
-        composeLogger("Multi Compose operation aborted: no valid stacks resolved", ['action' => $action, 'blocked' => $blockedStacks], 'user', 'warning', 'compose-multi');
+        composeLogger("Multi Compose operation aborted: no valid stacks resolved", ['action' => $action, 'blocked' => $blockedStacks, 'onePasswordBlocked' => array_keys($opBlockedStacks)], 'user', 'warning', 'compose-multi');
+        if (!empty($opBlockedStacks) && empty($blockedStacks)) {
+            echo json_encode([
+                'error' => 'onepassword',
+                'reason' => 'multiple',
+                'stacks' => array_keys($opBlockedStacks),
+                'message' => composeOnePasswordSkippedSummary($opBlockedStacks),
+            ]);
+            return;
+        }
         if (!empty($blockedStacks)) {
             echo json_encode([
                 'error' => 'identity',
@@ -551,6 +644,14 @@ function echoComposeCommandMultiple($action, array $options = [])
         'update' => 'Updating',
     ];
     $actionLabel = $actionLabelByType[$action] ?? ucfirst($action);
+
+    if ($background && !empty($opBlockedStacks)) {
+        composeSendNotification(
+            'Compose Manager: stacks skipped',
+            composeOnePasswordSkippedSummary($opBlockedStacks),
+            'warning'
+        );
+    }
 
     if ($background) {
         // Queue stacks sequentially in a single background wrapper script
@@ -583,6 +684,10 @@ function echoComposeCommandMultiple($action, array $options = [])
     foreach ($blockedStacks as $blocked) {
         $blockedTitle = str_replace(['\\', '"'], ['\\\\', '\\"'], $blocked);
         $scriptContent .= "echo \"! Skipped " . $blockedTitle . ": compose project identity is unresolved\"\n";
+    }
+
+    foreach ($opBlockedStacks as $blocked => $opMessage) {
+        $scriptContent .= 'echo ' . escapeshellarg('! Skipped ' . $blocked . ': ' . $opMessage) . "\n";
     }
 
     foreach ($commands as $idx => $cmd) {

@@ -12,6 +12,9 @@ COMPOSE_FILE_LIST="${COMPOSE_FILE_LIST:-}"
 COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-}"
 COMPOSE_PROJECT_DIR="${COMPOSE_PROJECT_DIR:-}"
 COMPOSE_CREDENTIAL_ID="${COMPOSE_CREDENTIAL_ID:-}"
+# Env file holding the stack's 1Password references, set by the PHP caller
+# when the configuration can be deployed with resolved secrets.
+COMPOSE_ONEPASSWORD_ENV_FILE="${COMPOSE_ONEPASSWORD_ENV_FILE:-}"
 COMPOSE_FILE="${COMPOSE_FILE_ARG:-${COMPOSE_FILE:-}}"
 DOCKER_CONFIG_DIR=""
 
@@ -132,6 +135,31 @@ fi
 if [ ${#compose_file_args[@]} -eq 0 ] && [ ${#project_dir_args[@]} -eq 0 ]; then
   echo "No compose file paths or project directory were provided" >&2
   exit 2
+fi
+
+# 1Password guard. Runs before any pull: pulling while the update cannot be
+# applied would make the next run see unchanged digests and never recreate.
+onepassword_files=()
+if [ -n "$COMPOSE_ENV_FILE" ]; then
+  onepassword_files+=("$COMPOSE_ENV_FILE")
+fi
+for (( i=1; i<${#compose_file_args[@]}; i+=2 )); do
+  onepassword_files+=("${compose_file_args[$i]}")
+done
+if [ -n "$COMPOSE_PROJECT_DIR" ] && [ -f "$COMPOSE_PROJECT_DIR/.env" ]; then
+  onepassword_files+=("$COMPOSE_PROJECT_DIR/.env")
+fi
+if [ -n "$COMPOSE_PROJECT_DIR" ] && [ ${#compose_file_args[@]} -eq 0 ]; then
+  onepassword_files+=("$(find_compose_file "$COMPOSE_PROJECT_DIR")" "$(find_compose_override_file "$COMPOSE_PROJECT_DIR")")
+fi
+if [ -n "$COMPOSE_ONEPASSWORD_ENV_FILE" ] || [ -n "$(onepassword_reference_files "${onepassword_files[@]}")" ]; then
+  MSG="Auto-update skipped for '$PROJECT_NAME': $(onepassword_message not_enabled)"
+  composeLogger "$MSG" warning autoupdate daemon
+  echo "$MSG" >&2
+  if [ -x "$NOTIFY" ]; then
+    "$NOTIFY" -e 'Compose Manager' -s "Auto-update skipped: $PROJECT_NAME" -d "$MSG" -i 'warning'
+  fi
+  exit "$ONEPASSWORD_BLOCKED_EXIT"
 fi
 
 # Create lock directory if needed

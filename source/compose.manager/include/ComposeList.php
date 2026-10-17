@@ -345,8 +345,19 @@ foreach ($stackInfos as $stackInfo) {
     // Check if stack has build configurations (needs rebuild on update)
     $hasBuild = $stackInfo->hasBuildConfig() ? '1' : '0';
 
+    // 1Password: file-only detection, independent of whether 1Password is unlocked.
+    try {
+        $opDetection = $stackInfo->getOnePasswordDetection();
+    } catch (\Throwable $e) {
+        $opDetection = null;
+    }
+    $usesOnePassword = $opDetection !== null && $opDetection->uses;
+    $opBlockReasonHtml = $usesOnePassword
+        ? htmlspecialchars((string) ($opDetection->getBlockReason() ?? ''), ENT_QUOTES, 'UTF-8')
+        : '';
+
     // Main row - Docker tab structure with expand arrow on left
-    $o .= "<tr class='compose-sortable' id='stack-row-$id' data-project='$projectHtml' data-projectname='$projectNameHtml' data-path='$pathHtml' data-isup='$isup' data-profiles='$profilesJson' data-running-profile='$runningProfilesHtml' data-default-profile='$defaultProfilesHtml' data-webui='$webuiUrlHtml' data-containers='$containerNamesAttr' data-ctids='$containerIdsAttr' data-hasbuild='$hasBuild' data-invalid-indirect='" . ($hasInvalidIndirect ? '1' : '0') . "' data-invalid-indirect-path='$invalidIndirectPathHtml' data-identity-blocked='" . ($identityBlocked ? '1' : '0') . "' data-identity-message='$identityMessageHtml' data-identity-folder='$identityFolderHtml' data-identity-legacy='$identityLegacyHtml'>";
+    $o .= "<tr class='compose-sortable' id='stack-row-$id' data-project='$projectHtml' data-projectname='$projectNameHtml' data-path='$pathHtml' data-isup='$isup' data-profiles='$profilesJson' data-running-profile='$runningProfilesHtml' data-default-profile='$defaultProfilesHtml' data-webui='$webuiUrlHtml' data-containers='$containerNamesAttr' data-ctids='$containerIdsAttr' data-hasbuild='$hasBuild' data-invalid-indirect='" . ($hasInvalidIndirect ? '1' : '0') . "' data-invalid-indirect-path='$invalidIndirectPathHtml' data-identity-blocked='" . ($identityBlocked ? '1' : '0') . "' data-identity-message='$identityMessageHtml' data-identity-folder='$identityFolderHtml' data-identity-legacy='$identityLegacyHtml' data-onepassword='" . ($usesOnePassword ? '1' : '0') . "' data-onepassword-blocked='" . ($opBlockReasonHtml !== '' ? '1' : '0') . "'>";
 
     // Arrow column
     $o .= "<td class='col-arrow'>";
@@ -368,7 +379,15 @@ foreach ($stackInfos as $stackInfo) {
 
     // Name column
     $o .= "<td class='col-name'>";
-    $o .= "<span class='inner'><span class='appname'>$projectNameHtml</span><br>";
+    $o .= "<span class='inner'><span class='appname'>$projectNameHtml</span>";
+    if ($usesOnePassword) {
+        $opTooltipHtml = htmlspecialchars(OnePassword::INDICATOR_TOOLTIP, ENT_QUOTES, 'UTF-8');
+        $o .= " <span class='compose-op-indicator' title='$opTooltipHtml'><i class='fa fa-key' aria-hidden='true'></i> 1Password</span>";
+        if ($opBlockReasonHtml !== '') {
+            $o .= " <i class='fa fa-exclamation-circle orange-text compose-op-config-warning' title='$opBlockReasonHtml'></i>";
+        }
+    }
+    $o .= "<br>";
     $o .= "<i class='fa fa-$shape $status $color compose-status-icon' data-status='$status'></i><span class='state'>$statusLabel</span>";
     if ($hasInvalidIndirect) {
         composeLogger('Rendering invalid indirect warning in stack list', [

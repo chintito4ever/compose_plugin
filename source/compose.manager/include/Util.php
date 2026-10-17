@@ -2,6 +2,7 @@
 
 require_once(__DIR__ . '/ProjectNameSanitizer.php');
 require_once(__DIR__ . '/ProjectIdentity.php');
+require_once(__DIR__ . '/OnePassword.php');
 require_once("/usr/local/emhttp/plugins/compose.manager/include/Defines.php");
 require_once("/usr/local/emhttp/plugins/dynamix/include/Wrappers.php");
 
@@ -2646,6 +2647,18 @@ class StackInfo
             return $val;
         }
         return $this->path . '/' . $val;
+    }
+
+    /**
+     * Scan this stack's effective configuration for 1Password references.
+     *
+     * Uses the same env file and compose files the compose command consumes.
+     * Reads files only: nothing is resolved and no command is run, so the
+     * result is the same whether or not 1Password is unlocked.
+     */
+    public function getOnePasswordDetection(): OnePasswordDetection
+    {
+        return OnePassword::scan($this->getEditableComposeFiles(), $this->getEffectiveEnvFilePath(), $this->composeSource);
     }
 
     public function getCredentialId(): ?string

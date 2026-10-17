@@ -12,7 +12,7 @@ LOCK_TIMEOUT=${COMPOSE_LOCK_TIMEOUT:-30}
 LOCK_DIR="/var/run/compose.manager"
 
 SHORT=e:,c:,f:,p:,d:,o:,g:,s:,w:
-LONG=env,command:,file:,project_name:,project_dir:,override:,profile:,debug,recreate,remove-orphans,stack-path:,workdir:,follow-logs,wait,wait-timeout:,build,credential-id:
+LONG=env,command:,file:,project_name:,project_dir:,override:,profile:,debug,recreate,remove-orphans,stack-path:,workdir:,follow-logs,wait,wait-timeout:,build,credential-id:,op-env-file:,op-managed,op-locked-start-existing
 OPTS=$(getopt -a -n compose --options $SHORT --longoptions $LONG -- "$@")
 
 eval set -- "$OPTS"
@@ -34,6 +34,10 @@ lock_fd=""
 operation_exit_code=0
 credential_id=""
 docker_config_dir=""
+# 1Password: set by callers that resolved the stack config (see OnePassword.php).
+op_env_file=""
+op_managed=false
+op_locked_start_existing=false
 
 
 # Logging helper — delegates to shared composeLogger, adds console echo in debug mode
@@ -222,6 +226,19 @@ do
       credential_id="$2"
       shift 2
       ;;
+    --op-env-file )
+      op_env_file="$2"
+      op_managed=true
+      shift 2
+      ;;
+    --op-managed )
+      op_managed=true
+      shift;
+      ;;
+    --op-locked-start-existing )
+      op_locked_start_existing=true
+      shift;
+      ;;
     --)
       shift;
       break
@@ -278,6 +295,113 @@ case $command in
     if ! acquire_lock "$lock_name"; then
       exit 1
     fi
+    ;;
+esac
+
+# ------------------------------------------------------------
+# 1Password guard
+# ------------------------------------------------------------
+# `up` and `update` create or recreate containers, so a stack whose config
+# holds op:// references must never reach them with the references
+# unresolved. Everything else (down, pull, stop, logs) passes no environment
+# to new containers and keeps working while 1Password is locked.
+
+# Compose files this command reads: explicit -f files, or the files Docker
+# Compose discovers in the project directory.
+op_compose_files() {
+  local i
+  for (( i=0; i<${#file_args[@]}; i++ )); do
+    if [ "${file_args[$i]}" = "-f" ]; then
+      printf '%s\n' "${file_args[$((i+1))]}"
+    fi
+  done
+  if [ ${#file_args[@]} -eq 0 ] && [ -n "$project_directory" ]; then
+    find_compose_file "$project_directory"
+    find_compose_override_file "$project_directory"
+  fi
+}
+
+# Env file Docker Compose interpolates from: --env-file, else the .env next to
+# the project.
+op_interpolation_env_file() {
+  local first_file=""
+  if [ -n "$envFile" ]; then
+    echo "$envFile"
+    return
+  fi
+  if [ -n "$project_directory" ] && [ -f "$project_directory/.env" ]; then
+    echo "$project_directory/.env"
+    return
+  fi
+  first_file=$(op_compose_files | head -n 1)
+  if [ -n "$first_file" ] && [ -f "$(dirname "$first_file")/.env" ]; then
+    echo "$(dirname "$first_file")/.env"
+  fi
+}
+
+onepassword_block() {
+  local reason="$1"
+  log_msg "WARNING" "Blocked $command for $name: project uses 1Password secrets ($reason)"
+  save_result "failed" "$ONEPASSWORD_BLOCKED_EXIT" "$command"
+  echo ""
+  echo "✗ $(onepassword_message "$reason")"
+  exit "$ONEPASSWORD_BLOCKED_EXIT"
+}
+
+# Autostart fallback: start containers that already exist (Docker keeps their
+# resolved environment) without creating or recreating any.
+onepassword_start_existing() {
+  local reason="$1"
+  local rc
+  echo "! $(onepassword_message "$reason")"
+  echo "Starting existing containers without recreating them..."
+  "${compose_base[@]}" -p "$name" start
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    save_result "success" 0 "up"
+    log_msg "WARNING" "Started existing containers only for $name: 1Password secrets could not be resolved ($reason)"
+    echo ""
+    echo "✓ Existing containers for $name started. Missing or outdated containers were left unchanged; unlock 1Password and run Compose Up to create or recreate them."
+  else
+    save_result "failed" $rc "up"
+    log_msg "ERROR" "Failed to start existing containers for $name (exit code: $rc); 1Password secrets could not be resolved ($reason)"
+    echo ""
+    echo "✗ Could not start existing containers for $name (exit code: $rc). Unlock 1Password and run Compose Up to create them."
+  fi
+  exit $rc
+}
+
+onepassword_guard() {
+  local env_candidate
+  local -a check_files=()
+  local referenced=""
+
+  env_candidate=$(op_interpolation_env_file)
+  if [ -n "$env_candidate" ]; then
+    check_files+=("$env_candidate")
+  fi
+  if [ -n "$op_env_file" ]; then
+    check_files+=("$op_env_file")
+  fi
+  while IFS= read -r compose_file; do
+    [ -n "$compose_file" ] && check_files+=("$compose_file")
+  done < <(op_compose_files)
+  referenced=$(onepassword_reference_files "${check_files[@]}")
+
+  if [ "$op_managed" != true ] && [ -z "$referenced" ]; then
+    return 0
+  fi
+
+  local reason="not_enabled"
+  if [ "$op_locked_start_existing" = true ] && [ "$command" = "up" ]; then
+    onepassword_start_existing "$reason"
+  fi
+  onepassword_block "$reason"
+}
+
+case $command in
+  up|update)
+    onepassword_guard
     ;;
 esac
 

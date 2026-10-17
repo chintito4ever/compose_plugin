@@ -159,7 +159,21 @@ switch ($action) {
                 break;
             }
             $projectName = $stackInfo->projectName;
+            $opGate = OnePassword::deploymentGate($stackInfo->getOnePasswordDetection());
+            if (!$opGate['allowed']) {
+                composeLogger(
+                    "Blocked manual auto-update for '{$stackInfo->projectFolder}': " . $opGate['message'],
+                    null,
+                    'user',
+                    'warning',
+                    'onepassword'
+                );
+                http_response_code(409);
+                echo json_encode(array('error' => $opGate['message'], 'errorCode' => 'onepassword', 'reason' => $opGate['reason']));
+                break;
+            }
         } else {
+            $opGate = array('managed' => false, 'envFile' => null);
             $projectName = basename($path);
             if (is_file("$path/name")) {
                 $projectName = trim(file_get_contents("$path/name"));
@@ -203,6 +217,9 @@ switch ($action) {
         }
         if ($credentialId !== null && $credentialId !== '') {
             $envPrefix .= 'COMPOSE_CREDENTIAL_ID=' . escapeshellarg($credentialId) . ' ';
+        }
+        if (!empty($opGate['managed']) && !empty($opGate['envFile'])) {
+            $envPrefix .= 'COMPOSE_ONEPASSWORD_ENV_FILE=' . escapeshellarg((string) $opGate['envFile']) . ' ';
         }
 
         $cmd = $envPrefix . $shCmd . ' ' . escapeshellarg($script) . " " . escapeshellarg($projectName) . " 2>&1";

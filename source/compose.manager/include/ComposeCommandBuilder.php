@@ -41,6 +41,34 @@ class ComposeCommandBuilder
             'profiles' => self::resolveProfilesForAction($stackInfo, $action),
             'stackPath' => $stackPath ?? $stackInfo->path,
             'credentialId' => $credentialId,
+            'onePassword' => self::resolveOnePasswordForAction($stackInfo, $action),
+        ];
+    }
+
+    /**
+     * 1Password verdict for actions that create or recreate containers.
+     *
+     * Other actions never pass environment values to new containers, so they
+     * report `managed: false` and keep running while 1Password is locked.
+     *
+     * @return array{managed: bool, envFile: string, blocker: string}
+     */
+    private static function resolveOnePasswordForAction(StackInfo $stackInfo, string $action): array
+    {
+        $none = ['managed' => false, 'envFile' => '', 'blocker' => ''];
+        if (!in_array($action, ['up', 'update'], true)) {
+            return $none;
+        }
+
+        $detection = $stackInfo->getOnePasswordDetection();
+        if (!$detection->uses) {
+            return $none;
+        }
+
+        return [
+            'managed' => true,
+            'envFile' => $detection->isDeployable() ? (string) $detection->envFile : '',
+            'blocker' => (string) ($detection->getBlockReason() ?? ''),
         ];
     }
 
