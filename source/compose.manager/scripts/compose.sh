@@ -38,6 +38,8 @@ docker_config_dir=""
 op_env_file=""
 op_managed=false
 op_locked_start_existing=false
+# Command prefix that resolves 1Password references for `up` only (see onepassword_prepare).
+op_prefix=()
 
 
 # Logging helper — delegates to shared composeLogger, adds console echo in debug mode
@@ -341,10 +343,15 @@ op_interpolation_env_file() {
 
 onepassword_block() {
   local reason="$1"
+  local detail="${2:-}"
   log_msg "WARNING" "Blocked $command for $name: project uses 1Password secrets ($reason)"
   save_result "failed" "$ONEPASSWORD_BLOCKED_EXIT" "$command"
   echo ""
   echo "✗ $(onepassword_message "$reason")"
+  if [ -n "$detail" ]; then
+    echo "1Password CLI reported:"
+    printf '  %s\n' "$detail"
+  fi
   exit "$ONEPASSWORD_BLOCKED_EXIT"
 }
 
@@ -373,30 +380,48 @@ onepassword_start_existing() {
 
 onepassword_guard() {
   local env_candidate
-  local -a check_files=()
-  local referenced=""
+  local -a compose_files=()
+  local env_refs="" yaml_refs=""
 
   env_candidate=$(op_interpolation_env_file)
-  if [ -n "$env_candidate" ]; then
-    check_files+=("$env_candidate")
-  fi
-  if [ -n "$op_env_file" ]; then
-    check_files+=("$op_env_file")
-  fi
   while IFS= read -r compose_file; do
-    [ -n "$compose_file" ] && check_files+=("$compose_file")
+    [ -n "$compose_file" ] && compose_files+=("$compose_file")
   done < <(op_compose_files)
-  referenced=$(onepassword_reference_files "${check_files[@]}")
+  env_refs=$(onepassword_reference_files "$env_candidate")
+  yaml_refs=$(onepassword_reference_files "${compose_files[@]}")
 
-  if [ "$op_managed" != true ] && [ -z "$referenced" ]; then
+  if [ "$op_managed" != true ] && [ -z "$env_refs" ] && [ -z "$yaml_refs" ]; then
     return 0
   fi
 
-  local reason="not_enabled"
+  local reason="" detail=""
+  if [ -n "$yaml_refs" ]; then
+    # Literal op:// in compose YAML would reach containers as text.
+    reason="unsupported"
+  elif [ -z "$op_env_file" ]; then
+    # Only callers that ran the PHP detection may deploy a 1Password stack.
+    if [ -n "$env_refs" ] && [ "$op_managed" != true ]; then
+      reason="unverified"
+    else
+      reason="unsupported"
+    fi
+  elif [ -n "$env_refs" ] && [ "$(realpath -m "$env_candidate")" != "$(realpath -m "$op_env_file")" ]; then
+    # Compose would interpolate from a different file than op run resolves.
+    reason="unsupported"
+  elif onepassword_prepare "$op_env_file"; then
+    op_prefix=("${ONEPASSWORD_RUN_PREFIX[@]}")
+    log_msg "INFO" "Resolving 1Password secrets for $name ($command) from $op_env_file"
+    echo "Resolving 1Password secrets for $name at deploy time (values are never shown)."
+    return 0
+  else
+    reason="$ONEPASSWORD_BLOCK_REASON"
+    detail="$ONEPASSWORD_BLOCK_DETAIL"
+  fi
+
   if [ "$op_locked_start_existing" = true ] && [ "$command" = "up" ]; then
     onepassword_start_existing "$reason"
   fi
-  onepassword_block "$reason"
+  onepassword_block "$reason" "$detail"
 }
 
 case $command in
@@ -436,12 +461,12 @@ case $command in
       if [ "$debug" = true ]; then
         log_msg "DEBUG" "${compose_base[*]} -p $name up ${cmd_args[*]}"
       fi
-      "${compose_base[@]}" -p "$name" up "${cmd_args[@]}"
+      "${op_prefix[@]}" "${compose_base[@]}" -p "$name" up "${cmd_args[@]}"
     else
       if [ "$debug" = true ]; then
         log_msg "DEBUG" "${compose_base[*]} -p $name up ${cmd_args[*]} -d"
       fi
-      "${compose_base[@]}" -p "$name" up "${cmd_args[@]}" -d
+      "${op_prefix[@]}" "${compose_base[@]}" -p "$name" up "${cmd_args[@]}" -d
     fi
     exit_code=$?
     operation_exit_code=$exit_code
@@ -564,7 +589,7 @@ case $command in
     # Recreate containers with new images
     echo ""
     echo "Recreating containers..."
-    "${compose_base[@]}" -p "$name" up "${up_args[@]}"
+    "${op_prefix[@]}" "${compose_base[@]}" -p "$name" up "${up_args[@]}"
     up_exit=$?
 
     if [ $up_exit -eq 0 ]; then

@@ -41,6 +41,7 @@ Access settings via **Settings → Compose** in the Unraid web UI.
 |---------|---------|-------------|
 | **Legacy Patch Web UI** | No | Enable integration patches for the native Docker manager UI on Unraid ≤ 6.11. Not required on Unraid 6.12 and later. Use the Patch/Unpatch buttons to apply or remove the patch. |
 | **Debug to Log** | No | Enable debug logging to syslog to troubleshoot Compose command output. |
+| **Resolve 1Password Secrets on Deploy** | Yes | For stacks whose env file holds `op://` references, resolve them with `op-secure run` when deploying. When off, Up/Update/auto-update are refused for those stacks. See [1Password Integration](1password.md). |
 
 ### Backup Settings
 

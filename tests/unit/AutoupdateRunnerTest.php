@@ -44,6 +44,7 @@ if ($marker) {
         'argv' => $argv,
         'parallelLimit' => getenv('COMPOSE_PARALLEL_LIMIT'),
         'credentialId' => getenv('COMPOSE_CREDENTIAL_ID'),
+        'onePasswordEnvFile' => getenv('COMPOSE_ONEPASSWORD_ENV_FILE'),
     ]));
 }
 exit(0);
@@ -59,6 +60,7 @@ PHP;
     protected function tearDown(): void
     {
         global $plugin_root;
+        \OnePassword::configure([]);
         putenv('COMPOSE_MANAGER_CRON_DIR');
         putenv('COMPOSE_MANAGER_SH');
         putenv('AUTOTEST_MARKER');
@@ -134,5 +136,65 @@ PHP;
         $this->assertArrayHasKey($path, $updated);
         $this->assertArrayHasKey('last_run', $updated[$path]);
         $this->assertGreaterThan(0, (int) $updated[$path]['last_run']);
+    }
+
+    /**
+     * @return array{0: string, 1: string} Stack path and fake 1Password root
+     */
+    private function createOnePasswordStack(): array
+    {
+        global $compose_root;
+        $stack = 'opstack_' . getmypid();
+        $path = $compose_root . '/' . $stack;
+        $this->testStackPath = $path;
+        mkdir($path, 0755, true);
+        file_put_contents($path . '/docker-compose.yml', "services:\n web:\n  image: busybox\n  environment:\n   PASS: \${PASS}\n");
+        file_put_contents($path . '/.env', "PASS=op://Homelab Secrets/Test/PASS\n");
+
+        $opRoot = sys_get_temp_dir() . '/autoupdate_runner_op_' . getmypid() . '_' . uniqid('', true);
+        mkdir($opRoot . '/run', 0755, true);
+        file_put_contents($opRoot . '/op-secure', "#!/bin/sh\nexit 0\n");
+        chmod($opRoot . '/op-secure', 0755);
+        \OnePassword::configure([
+            'opSecure' => $opRoot . '/op-secure',
+            'opStatus' => $opRoot . '/missing-op-status',
+            'tokenFile' => $opRoot . '/run/token',
+            'cacheFile' => $opRoot . '/cache.json',
+        ]);
+
+        $cfg = [$path => ['enabled' => true, 'schedule' => 'daily', 'time' => '00:00']];
+        file_put_contents((string) $this->autoUpdateConfigFile, json_encode($cfg, JSON_PRETTY_PRINT));
+        putenv('COMPOSE_MANAGER_SH=' . PHP_BINARY . ' ' . escapeshellarg((string) $this->wrapperPath));
+        \StackInfo::clearCache();
+
+        return [$path, $opRoot];
+    }
+
+    public function testRunnerSkipsOnePasswordStackWhileLocked(): void
+    {
+        global $plugin_root, $compose_root;
+        $this->createOnePasswordStack();
+
+        include $plugin_root . 'include/AutoUpdateRunner.php';
+
+        usleep(300000);
+        $this->assertFileDoesNotExist((string) $this->markerPath, 'Locked 1Password stack must not be auto-updated');
+    }
+
+    public function testRunnerPassesOnePasswordEnvFileWhenUnlocked(): void
+    {
+        global $plugin_root, $compose_root;
+        [$path, $opRoot] = $this->createOnePasswordStack();
+        file_put_contents($opRoot . '/run/token', 'ops_FAKE_TEST_TOKEN');
+
+        include $plugin_root . 'include/AutoUpdateRunner.php';
+
+        $deadline = microtime(true) + 3;
+        while (!is_file((string) $this->markerPath) && microtime(true) < $deadline) {
+            usleep(10000);
+        }
+        $this->assertFileExists((string) $this->markerPath);
+        $payload = json_decode((string) file_get_contents((string) $this->markerPath), true);
+        $this->assertSame($path . '/.env', $payload['onePasswordEnvFile']);
     }
 }

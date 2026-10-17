@@ -398,6 +398,71 @@ onepassword_state() {
     fi
 }
 
+# True when a true/false setting is explicitly "false" in the plugin config.
+plugin_setting_disabled() {
+    local key="$1"
+    local cfg_file="${COMPOSE_MANAGER_CFG_FILE:-/boot/config/plugins/compose.manager/compose.manager.cfg}"
+    [ -f "$cfg_file" ] || return 1
+    grep -Eq "^${key}=\"?false\"?[[:space:]]*$" "$cfg_file"
+}
+
+# Prepare secret-aware execution for an env file holding op:// references.
+#
+# Checks, in order, without touching any container: the setting is on, the
+# CLI helper exists, the RAM token is present, op-secure can authenticate,
+# and every reference in the env file resolves. Output of these checks is
+# discarded except op's error lines, which name references, never values.
+#
+# On success fills ONEPASSWORD_RUN_PREFIX with the command prefix to put in
+# front of `docker compose ... up`, and returns 0:
+#   op-secure run --env-file=<file> -- env -u OP_SERVICE_ACCOUNT_TOKEN ... docker compose ...
+# `op run` exports the resolved values only to that one process; `env -u`
+# keeps the 1Password credentials out of Docker Compose's environment, so a
+# compose file cannot pass them to a container. Masking stays on (no
+# --no-masking), so values compose prints are redacted.
+#
+# On failure sets ONEPASSWORD_BLOCK_REASON (and ONEPASSWORD_BLOCK_DETAIL) and returns 1.
+# shellcheck disable=SC2034  # Result variables are consumed by scripts that source common.sh.
+onepassword_prepare() {
+    local env_file="$1"
+    local op_secure="${COMPOSE_OP_SECURE_BIN:-/usr/local/bin/op-secure}"
+    local check_timeout="${COMPOSE_OP_CHECK_TIMEOUT:-30}"
+    local state err
+
+    ONEPASSWORD_RUN_PREFIX=()
+    ONEPASSWORD_BLOCK_REASON=""
+    ONEPASSWORD_BLOCK_DETAIL=""
+
+    if [ -z "$env_file" ] || [ ! -f "$env_file" ]; then
+        ONEPASSWORD_BLOCK_REASON="unverified"
+        return 1
+    fi
+    if plugin_setting_disabled ONEPASSWORD_SECRET_INJECTION; then
+        ONEPASSWORD_BLOCK_REASON="not_enabled"
+        return 1
+    fi
+    state=$(onepassword_state)
+    if [ "$state" != "unlocked" ]; then
+        ONEPASSWORD_BLOCK_REASON="$state"
+        return 1
+    fi
+    if ! timeout "$check_timeout" "$op_secure" whoami </dev/null >/dev/null 2>&1; then
+        ONEPASSWORD_BLOCK_REASON="auth_failed"
+        return 1
+    fi
+    if ! err=$(timeout "$check_timeout" "$op_secure" run "--env-file=$env_file" -- true </dev/null 2>&1 >/dev/null); then
+        ONEPASSWORD_BLOCK_REASON="lookup_failed"
+        ONEPASSWORD_BLOCK_DETAIL=$(printf '%s\n' "$err" | tr -cd '[:print:]\n' | tail -n 5)
+        return 1
+    fi
+
+    ONEPASSWORD_RUN_PREFIX=(
+        "$op_secure" run "--env-file=$env_file" --
+        env -u OP_SERVICE_ACCOUNT_TOKEN -u OP_CONNECT_TOKEN -u OP_CONNECT_HOST
+    )
+    return 0
+}
+
 # User-facing message for a 1Password block reason (kept in sync with OnePassword.php).
 onepassword_message() {
     case "$1" in
@@ -407,11 +472,23 @@ onepassword_message() {
         locked)
             echo "This project uses 1Password secrets. Unlock 1Password on Unraid using op-unlock before deploying."
             ;;
+        auth_failed)
+            echo "This project uses 1Password secrets, but op-secure could not authenticate to 1Password. Run op-status on Unraid, then op-unlock if needed, before deploying."
+            ;;
+        lookup_failed)
+            echo "This project uses 1Password secrets, but at least one secret reference could not be resolved. Check the op:// references in the project env file; no containers were changed."
+            ;;
         unsupported)
             echo "This project uses 1Password secrets, but its configuration cannot be deployed safely (op:// references outside the project env file, an invalid reference, or a service env_file). Open the stack in Compose Manager to see the reason."
             ;;
+        unverified)
+            echo "This project uses 1Password secrets, but this command was not prepared by Compose Manager's 1Password check. Run it from the Compose Manager UI."
+            ;;
+        not_enabled)
+            echo "This project uses 1Password secrets, and resolving them on deploy is turned off (Settings > Resolve 1Password Secrets on Deploy). The action was blocked so unresolved op:// references are never passed to containers. Running containers were not changed."
+            ;;
         *)
-            echo "This project uses 1Password secrets. Deploying it from Compose Manager is blocked so unresolved op:// references are never passed to containers. Running containers were not changed."
+            echo "This project uses 1Password secrets that could not be resolved. The action was blocked; running containers were not changed."
             ;;
     esac
 }

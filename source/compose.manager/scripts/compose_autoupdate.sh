@@ -139,27 +139,47 @@ fi
 
 # 1Password guard. Runs before any pull: pulling while the update cannot be
 # applied would make the next run see unchanged digests and never recreate.
-onepassword_files=()
+onepassword_env_files=()
+onepassword_yaml_files=()
 if [ -n "$COMPOSE_ENV_FILE" ]; then
-  onepassword_files+=("$COMPOSE_ENV_FILE")
+  onepassword_env_files+=("$COMPOSE_ENV_FILE")
 fi
 for (( i=1; i<${#compose_file_args[@]}; i+=2 )); do
-  onepassword_files+=("${compose_file_args[$i]}")
+  onepassword_yaml_files+=("${compose_file_args[$i]}")
 done
-if [ -n "$COMPOSE_PROJECT_DIR" ] && [ -f "$COMPOSE_PROJECT_DIR/.env" ]; then
-  onepassword_files+=("$COMPOSE_PROJECT_DIR/.env")
+# Without --env-file, Docker Compose loads the .env next to the first compose file.
+if [ -z "$COMPOSE_ENV_FILE" ] && [ ${#compose_file_args[@]} -gt 1 ]; then
+  onepassword_env_files+=("$(dirname "${compose_file_args[1]}")/.env")
 fi
 if [ -n "$COMPOSE_PROJECT_DIR" ] && [ ${#compose_file_args[@]} -eq 0 ]; then
-  onepassword_files+=("$(find_compose_file "$COMPOSE_PROJECT_DIR")" "$(find_compose_override_file "$COMPOSE_PROJECT_DIR")")
+  [ -z "$COMPOSE_ENV_FILE" ] && onepassword_env_files+=("$COMPOSE_PROJECT_DIR/.env")
+  onepassword_yaml_files+=("$(find_compose_file "$COMPOSE_PROJECT_DIR")" "$(find_compose_override_file "$COMPOSE_PROJECT_DIR")")
 fi
-if [ -n "$COMPOSE_ONEPASSWORD_ENV_FILE" ] || [ -n "$(onepassword_reference_files "${onepassword_files[@]}")" ]; then
-  MSG="Auto-update skipped for '$PROJECT_NAME': $(onepassword_message not_enabled)"
+
+onepassword_skip() {
+  local reason="$1"
+  MSG="Auto-update skipped for '$PROJECT_NAME': $(onepassword_message "$reason")"
   composeLogger "$MSG" warning autoupdate daemon
   echo "$MSG" >&2
   if [ -x "$NOTIFY" ]; then
     "$NOTIFY" -e 'Compose Manager' -s "Auto-update skipped: $PROJECT_NAME" -d "$MSG" -i 'warning'
   fi
   exit "$ONEPASSWORD_BLOCKED_EXIT"
+}
+
+# Prefix that resolves 1Password references for the `up -d` call only.
+op_prefix=()
+if [ -n "$(onepassword_reference_files "${onepassword_yaml_files[@]}")" ]; then
+  onepassword_skip unsupported
+elif [ -n "$COMPOSE_ONEPASSWORD_ENV_FILE" ] || [ -n "$(onepassword_reference_files "${onepassword_env_files[@]}")" ]; then
+  if [ -z "$COMPOSE_ONEPASSWORD_ENV_FILE" ]; then
+    onepassword_skip unverified
+  fi
+  if ! onepassword_prepare "$COMPOSE_ONEPASSWORD_ENV_FILE"; then
+    onepassword_skip "$ONEPASSWORD_BLOCK_REASON"
+  fi
+  op_prefix=("${ONEPASSWORD_RUN_PREFIX[@]}")
+  composeLogger "Resolving 1Password secrets for '$PROJECT_NAME' auto-update" info autoupdate daemon
 fi
 
 # Create lock directory if needed
@@ -259,7 +279,7 @@ if [ "$OLD_DIGESTS" != "$NEW_DIGESTS" ]; then
   fi
 
   # Images changed - run recreate/up
-  timeout "$COMMAND_TIMEOUT" docker compose "${project_dir_args[@]}" "${compose_file_args[@]}" "${env_file_args[@]}" -p "$PROJECT_NAME" up -d >> "$OUT" 2>&1 || RC=$?
+  timeout "$COMMAND_TIMEOUT" "${op_prefix[@]}" docker compose "${project_dir_args[@]}" "${compose_file_args[@]}" "${env_file_args[@]}" -p "$PROJECT_NAME" up -d >> "$OUT" 2>&1 || RC=$?
   
   if [ "$RC" -ne 0 ]; then
     ERRMSG="Auto-update up failed for '$PROJECT_NAME'. Recent output: $(summarize_output)"

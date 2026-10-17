@@ -2814,6 +2814,19 @@ $acePath = file_exists('/usr/local/emhttp/plugins/dynamix/javascript/ace/ace.js'
         </dl>
 
         <dl>
+            <dt style="cursor: help;" onclick="toggleHelp(this)">_(Resolve 1Password Secrets on Deploy)_:</dt>
+            <dd>
+                <input type="checkbox" name="ONEPASSWORD_SECRET_INJECTION" id="ONEPASSWORD_SECRET_INJECTION" class="compose-toggle" <?= ($cfg['ONEPASSWORD_SECRET_INJECTION'] ?? 'true') == 'true' ? 'checked' : '' ?>>
+                <blockquote class="inline_help">
+                    Stacks whose env file holds <code>op://</code> secret references are deployed through <code>op-secure run --env-file=&lt;env file&gt; -- docker compose ...</code>,
+                    so containers receive the resolved values. Requires the 1Password CLI helpers on Unraid and an unlocked session (<code>op-unlock</code>).
+                    When disabled, Compose Up, Update and auto-update are refused for those stacks instead, so <code>op://</code> text is never passed to a container.
+                    Logs, Stop, Down and Pull work either way.
+                </blockquote>
+            </dd>
+        </dl>
+
+        <dl>
             <dt style="cursor: help;" onclick="toggleHelp(this)">_(Create Missing External Networks)_:</dt>
             <dd>
                 <input type="checkbox" name="CREATE_MISSING_EXTERNAL_NETWORKS" id="CREATE_MISSING_EXTERNAL_NETWORKS" class="compose-toggle" <?= ($cfg['CREATE_MISSING_EXTERNAL_NETWORKS'] ?? 'false') == 'true' ? 'checked' : '' ?>>

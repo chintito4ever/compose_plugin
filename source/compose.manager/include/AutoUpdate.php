@@ -173,7 +173,12 @@ switch ($action) {
                 break;
             }
         } else {
-            $opGate = array('managed' => false, 'envFile' => null);
+            $opGate = OnePassword::deploymentGate(OnePassword::scanDirectory($path, $composeFile));
+            if (!$opGate['allowed']) {
+                http_response_code(409);
+                echo json_encode(array('error' => $opGate['message'], 'errorCode' => 'onepassword', 'reason' => $opGate['reason']));
+                break;
+            }
             $projectName = basename($path);
             if (is_file("$path/name")) {
                 $projectName = trim(file_get_contents("$path/name"));
@@ -192,7 +197,7 @@ switch ($action) {
             $credentialId = $stackInfo->getCredentialId();
         } else {
             $composeFileList = $composeFile;
-            $envFilePath = null;
+            $envFilePath = !empty($opGate['managed']) ? $opGate['envFile'] : null;
             $projectDirectory = $path;
             $credentialIdFile = rtrim($path, '/') . '/credential_id';
             $credentialId = is_file($credentialIdFile)

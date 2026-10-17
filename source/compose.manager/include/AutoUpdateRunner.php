@@ -130,7 +130,12 @@ foreach ($data as $path => $entry) {
             }
         } else {
             $projectName = StackInfo::sanitizeProjectString(basename($path));
-            $opGate = ['managed' => false, 'envFile' => null];
+            $opGate = OnePassword::deploymentGate(OnePassword::scanDirectory($path, $composeFile));
+            if (!$opGate['allowed']) {
+                composeLogger("Skipped scheduled auto-update for '" . basename($path) . "': " . $opGate['message'], null, 'daemon', 'warning', 'onepassword');
+                composeSendNotification('Auto-update skipped: ' . basename($path), (string) $opGate['message'], 'warning');
+                continue;
+            }
         }
 
         // Log the scheduled auto-update trigger
@@ -145,7 +150,7 @@ foreach ($data as $path => $entry) {
             $credentialId = $stackInfo->getCredentialId();
         } else {
             $composeFileList = findComposeFile($path);
-            $envFilePath = null;
+            $envFilePath = !empty($opGate['managed']) ? $opGate['envFile'] : null;
             $projectDirectory = $path;
             $credentialId = null;
         }

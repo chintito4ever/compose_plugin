@@ -306,3 +306,245 @@ output_not_contains() {
     assert_success
     docker_called_with "-p paperless pull --ignore-buildable"
 }
+
+# ============================================================
+# Phase 2: secret-aware deployment
+# ============================================================
+
+add_fixture() {
+    printf '%s\t%s\n' "$1" "$2" >> "$OP_FIXTURES"
+}
+
+add_sitespeed_fixtures() {
+    add_fixture "op://Homelab Secrets/Sitespeed - Grafana MCP/GRAFANA_MCP_TOKEN" "$FAKE_SECRET"
+    add_fixture "op://Homelab Secrets/Sitespeed - Grafana MCP/GRAFANA_MCP_SERVER_TOKEN" "resolved-server-token"
+}
+
+# The docker log line block (ARGS + ENV lines) for the first call matching $1.
+docker_call_env() {
+    awk -v pat="$1" '/^ARGS:/ { show = ($0 ~ pat) } show' "$DOCKER_LOG"
+}
+
+@test "unlocked: up resolves secrets for docker compose only and strips the token" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env" --debug
+    assert_success
+    assert_output_contains "Resolving 1Password secrets"
+    docker_called_with "compose --env-file $dir/.env -f $dir/compose.yaml -p sitespeedio up -d"
+    [ "$(docker_call_env ' up ' | grep '^ENV_GRAFANA_MCP_TOKEN:')" = "ENV_GRAFANA_MCP_TOKEN:$FAKE_SECRET" ]
+    [ "$(docker_call_env ' up ' | grep '^ENV_OP_SERVICE_ACCOUNT_TOKEN:')" = "ENV_OP_SERVICE_ACCOUNT_TOKEN:<unset>" ]
+    grep -q -- "whoami" "$OP_CALL_LOG"
+    grep -q -- "run --env-file=$dir/.env -- true" "$OP_CALL_LOG"
+    output_not_contains "$FAKE_SECRET"
+    output_not_contains "$FAKE_TOKEN"
+    file_not_contains "$LOGGER_LOG" "$FAKE_SECRET"
+    file_not_contains "$LOGGER_LOG" "$FAKE_TOKEN"
+    assert_file_contains "$dir/last_result.json" '"result":"success"'
+}
+
+@test "unlocked: update pulls without secrets and recreates with them" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    run bash "$COMPOSE_SCRIPT" -c update -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env" --build
+    assert_success
+    [ "$(docker_call_env ' pull' | grep '^ENV_GRAFANA_MCP_TOKEN:')" = "ENV_GRAFANA_MCP_TOKEN:<unset>" ]
+    docker_called_with "-p sitespeedio up -d --build"
+    [ "$(docker_call_env ' up -d' | grep '^ENV_GRAFANA_MCP_TOKEN:')" = "ENV_GRAFANA_MCP_TOKEN:$FAKE_SECRET" ]
+}
+
+@test "unlocked: compose flags, profiles and paths with spaces are preserved" {
+    local dir="$TEST_TEMP_DIR/My Stacks/site speed"
+    mkdir -p "$dir"
+    cp "$(create_sitespeed_stack)/compose.yaml" "$dir/compose.yaml"
+    cp "$TEST_TEMP_DIR/sitespeedio/.env" "$dir/.env"
+    printf 'services:\n  grafana-mcp:\n    labels:\n      a: b\n' > "$dir/compose.override.yaml"
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -f "$dir/compose.override.yaml" \
+        -e "$dir/.env" -g monitoring -s "$dir" --op-env-file "$dir/.env" \
+        --recreate --remove-orphans --wait --wait-timeout 45
+    assert_success
+    docker_called_with "compose --env-file $dir/.env -f $dir/compose.yaml -f $dir/compose.override.yaml --profile monitoring -p sitespeedio up --force-recreate --remove-orphans --wait --wait-timeout 45 -d"
+    [ "$(docker_call_env ' up ' | grep '^ENV_GRAFANA_MCP_TOKEN:')" = "ENV_GRAFANA_MCP_TOKEN:$FAKE_SECRET" ]
+}
+
+@test "unlocked: secret lookup failure blocks before any container change" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    # No fixtures: every reference fails to resolve.
+    run bash "$COMPOSE_SCRIPT" -c update -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env"
+    [ "$status" -eq 78 ]
+    assert_output_contains "could not be resolved"
+    assert_output_contains "could not resolve secret reference for GRAFANA_MCP_TOKEN"
+    docker_not_called_with " pull"
+    docker_not_called_with " up"
+}
+
+@test "unlocked: authentication failure blocks deployment" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    OP_STUB_AUTH_FAIL=1 run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" \
+        -s "$dir" --op-env-file "$dir/.env"
+    [ "$status" -eq 78 ]
+    assert_output_contains "could not authenticate"
+    docker_not_called_with " up"
+}
+
+@test "locked: deployment is blocked with op-unlock guidance" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env"
+    [ "$status" -eq 78 ]
+    assert_output_contains "Unlock 1Password on Unraid using op-unlock before deploying."
+    docker_not_called_with " up"
+    [ ! -s "$OP_CALL_LOG" ]
+}
+
+@test "no CLI installed: deployment is blocked with installation guidance" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    unlock_op
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env"
+    [ "$status" -eq 78 ]
+    assert_output_contains "op-secure"
+    assert_output_contains "Install the 1Password CLI"
+    docker_not_called_with " up"
+}
+
+@test "setting off: deployment is blocked even when unlocked" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    echo 'ONEPASSWORD_SECRET_INJECTION="false"' > "$COMPOSE_MANAGER_CFG_FILE"
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env"
+    [ "$status" -eq 78 ]
+    assert_output_contains "turned off"
+    docker_not_called_with " up"
+}
+
+@test "unlocked: literal op:// in compose YAML is never deployed" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    printf 'services:\n  grafana-mcp:\n    environment:\n      X: op://Vault/Item/field\n' > "$dir/compose.override.yaml"
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -f "$dir/compose.override.yaml" \
+        -e "$dir/.env" -s "$dir" --op-env-file "$dir/.env"
+    [ "$status" -eq 78 ]
+    docker_not_called_with " up"
+}
+
+@test "unlocked: env file mismatch between compose and op run is refused" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    printf 'OTHER=plain\n' > "$dir/other.env"
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/other.env"
+    [ "$status" -eq 78 ]
+    docker_not_called_with " up"
+}
+
+@test "autostart: unlocked stacks are deployed normally, not just started" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env" --op-locked-start-existing
+    assert_success
+    docker_called_with "-p sitespeedio up -d"
+    docker_not_called_with "-p sitespeedio start"
+}
+
+@test "autostart: lookup failure falls back to starting existing containers" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    run bash "$COMPOSE_SCRIPT" -c up -p sitespeedio -f "$dir/compose.yaml" -e "$dir/.env" -s "$dir" \
+        --op-env-file "$dir/.env" --op-locked-start-existing
+    assert_success
+    docker_called_with "-p sitespeedio start"
+    docker_not_called_with " up"
+}
+
+@test "auto-update: unlocked stack pulls plainly and recreates with secrets" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    # Make the digest comparison see a change so `up -d` runs.
+    cat > "$STUB_BIN/docker" <<'STUB'
+#!/bin/bash
+{
+    printf 'ARGS:%s\n' "$*"
+    printf 'ENV_GRAFANA_MCP_TOKEN:%s\n' "${GRAFANA_MCP_TOKEN-<unset>}"
+    printf 'ENV_OP_SERVICE_ACCOUNT_TOKEN:%s\n' "${OP_SERVICE_ACCOUNT_TOKEN-<unset>}"
+} >> "$DOCKER_LOG"
+case "$*" in
+  *"config --images"*) echo "grafana/mcp-grafana:latest" ;;
+  "image inspect"*) if grep -q 'ARGS:.* pull' "$DOCKER_LOG"; then echo "sha256:new"; else echo "sha256:old"; fi ;;
+  *" ps -q"*) echo "abc123" ;;
+esac
+exit 0
+STUB
+    chmod +x "$STUB_BIN/docker"
+    COMPOSE_FILE_LIST="$dir/compose.yaml" COMPOSE_ENV_FILE="$dir/.env" COMPOSE_ONEPASSWORD_ENV_FILE="$dir/.env" \
+        run bash "$AUTOUPDATE_SCRIPT" sitespeedio
+    assert_success
+    [ "$(docker_call_env ' pull' | grep '^ENV_GRAFANA_MCP_TOKEN:')" = "ENV_GRAFANA_MCP_TOKEN:<unset>" ]
+    docker_called_with "-p sitespeedio up -d"
+    [ "$(docker_call_env ' up -d' | grep '^ENV_GRAFANA_MCP_TOKEN:')" = "ENV_GRAFANA_MCP_TOKEN:$FAKE_SECRET" ]
+    [ "$(docker_call_env ' up -d' | grep '^ENV_OP_SERVICE_ACCOUNT_TOKEN:')" = "ENV_OP_SERVICE_ACCOUNT_TOKEN:<unset>" ]
+    output_not_contains "$FAKE_SECRET"
+}
+
+@test "auto-update: locked stack is skipped before pulling" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    COMPOSE_FILE_LIST="$dir/compose.yaml" COMPOSE_ENV_FILE="$dir/.env" COMPOSE_ONEPASSWORD_ENV_FILE="$dir/.env" \
+        run bash "$AUTOUPDATE_SCRIPT" sitespeedio
+    [ "$status" -eq 78 ]
+    assert_output_contains "op-unlock"
+    docker_not_called_with " pull"
+}
+
+@test "auto-update: default .env next to the compose file is checked" {
+    local dir
+    dir=$(create_sitespeed_stack)
+    install_fake_op
+    unlock_op
+    add_sitespeed_fixtures
+    COMPOSE_FILE_LIST="$dir/compose.yaml" run bash "$AUTOUPDATE_SCRIPT" sitespeedio
+    [ "$status" -eq 78 ]
+    docker_not_called_with " pull"
+}

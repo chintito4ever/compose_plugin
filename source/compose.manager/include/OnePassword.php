@@ -111,7 +111,7 @@ final class OnePassword
 
     public const LOCKED_MESSAGE = 'This project uses 1Password secrets. Unlock 1Password on Unraid using op-unlock before deploying.';
     public const UNAVAILABLE_MESSAGE = 'This project uses 1Password secrets, but the 1Password CLI helpers were not found. Install the 1Password CLI and the op-secure helper (/usr/local/bin/op-secure) on Unraid, then run op-unlock before deploying.';
-    public const NOT_ENABLED_MESSAGE = 'This project uses 1Password secrets. Deploying it from Compose Manager is blocked so unresolved op:// references are never passed to containers. Running containers were not changed.';
+    public const NOT_ENABLED_MESSAGE = 'This project uses 1Password secrets, and resolving them on deploy is turned off (Settings > Resolve 1Password Secrets on Deploy). The action was blocked so unresolved op:// references are never passed to containers. Running containers were not changed.';
     public const ERROR_MESSAGE ='This project uses 1Password secrets, but the 1Password status check failed. Run op-status on Unraid, then op-unlock if needed, before deploying.';
 
     /** How long a status result from op-status is reused, in seconds */
@@ -194,6 +194,11 @@ final class OnePassword
                     $detection->envFile = $envFile;
                     $detection->envKeys = $parsed['keys'];
                     $detection->invalidKeys = $parsed['invalid'];
+                    if ($parsed['interpolated'] !== []) {
+                        $detection->unsupported[] = 'Env file ' . basename($envFile) . ' uses ${...} interpolation in '
+                            . implode(', ', $parsed['interpolated'])
+                            . '. Under op run those values are not expanded the way Docker Compose would expand them, so they could change. Use literal values in the 1Password-managed env file.';
+                    }
                 }
             }
         }
@@ -266,17 +271,39 @@ final class OnePassword
     }
 
     /**
+     * Scan a plain stack directory when no StackInfo is available: the given
+     * compose file, the override files Docker Compose would pick up next to
+     * it, and the `.env` it loads by default.
+     */
+    public static function scanDirectory(string $dir, ?string $composeFile = null): OnePasswordDetection
+    {
+        $dir = rtrim($dir, '/');
+        $files = [];
+        if ($composeFile !== null && $composeFile !== '') {
+            $files[] = $composeFile;
+        }
+        foreach (['compose.override.yaml', 'compose.override.yml', 'docker-compose.override.yaml', 'docker-compose.override.yml'] as $name) {
+            if (is_file("$dir/$name")) {
+                $files[] = "$dir/$name";
+            }
+        }
+        $envFile = is_file("$dir/.env") ? "$dir/.env" : null;
+        return self::scan($files, $envFile, $dir);
+    }
+
+    /**
      * Find variable names whose value is a 1Password reference.
      *
      * Follows the env-file rules Compose and `op run` share: `KEY=value`
      * lines, optional `export ` prefix, `#` comments, optional quotes.
      *
-     * @return array{keys: string[], invalid: string[]}
+     * @return array{keys: string[], invalid: string[], interpolated: string[]}
      */
     public static function parseEnvReferences(string $content): array
     {
         $keys = [];
         $invalid = [];
+        $interpolated = [];
         foreach (preg_split('/\R/', $content) ?: [] as $line) {
             $line = trim($line);
             if ($line === '' || $line[0] === '#') {
@@ -290,7 +317,11 @@ final class OnePassword
                 continue;
             }
             $key = trim(substr($line, 0, $eq));
-            $value = self::unquoteEnvValue(trim(substr($line, $eq + 1)));
+            $rawValue = trim(substr($line, $eq + 1));
+            $value = self::unquoteEnvValue($rawValue);
+            if (!str_starts_with($rawValue, "'") && preg_match('/\$\{?[A-Za-z_]/', $value) === 1) {
+                $interpolated[] = $key;
+            }
             if (!str_contains($value, 'op://')) {
                 continue;
             }
@@ -300,7 +331,11 @@ final class OnePassword
                 $invalid[] = $key;
             }
         }
-        return ['keys' => array_values(array_unique($keys)), 'invalid' => array_values(array_unique($invalid))];
+        return [
+            'keys' => array_values(array_unique($keys)),
+            'invalid' => array_values(array_unique($invalid)),
+            'interpolated' => array_values(array_unique($interpolated)),
+        ];
     }
 
     /**
@@ -614,9 +649,14 @@ final class OnePassword
      * Decide whether an operation that creates or recreates containers
      * (up, update) may run for a stack.
      *
+     * Ordinary stacks are always allowed. 1Password stacks are allowed only
+     * when their configuration is supported, secret-aware deployment is
+     * enabled, and 1Password is unlocked; the caller then passes the env
+     * file to compose.sh, which resolves the references with op-secure.
+     *
      * @return array{allowed: bool, managed: bool, reason: ?string, message: ?string, envFile: ?string}
      */
-    public static function deploymentGate(OnePasswordDetection $detection): array
+    public static function deploymentGate(OnePasswordDetection $detection, ?bool $injectionEnabled = null): array
     {
         if (!$detection->uses) {
             return ['allowed' => true, 'managed' => false, 'reason' => null, 'message' => null, 'envFile' => null];
@@ -633,13 +673,48 @@ final class OnePassword
             ];
         }
 
+        if (!($injectionEnabled ?? self::injectionEnabled())) {
+            return [
+                'allowed' => false,
+                'managed' => true,
+                'reason' => 'not_enabled',
+                'message' => self::NOT_ENABLED_MESSAGE,
+                'envFile' => $detection->envFile,
+            ];
+        }
+
+        $state = self::status()['state'];
+        if ($state !== self::STATE_UNLOCKED) {
+            return [
+                'allowed' => false,
+                'managed' => true,
+                'reason' => $state,
+                'message' => self::messageForState($state),
+                'envFile' => $detection->envFile,
+            ];
+        }
+
+        // Unlocked: compose.sh resolves the references through op-secure at run time.
         return [
-            'allowed' => false,
+            'allowed' => true,
             'managed' => true,
-            'reason' => 'not_enabled',
-            'message' => self::NOT_ENABLED_MESSAGE,
+            'reason' => null,
+            'message' => null,
             'envFile' => $detection->envFile,
         ];
+    }
+
+    /**
+     * Whether secret-aware deployment is enabled in plugin settings
+     * (ONEPASSWORD_SECRET_INJECTION, default on).
+     */
+    public static function injectionEnabled(): bool
+    {
+        if (!function_exists('parse_plugin_cfg')) {
+            return true;
+        }
+        $cfg = parse_plugin_cfg('compose.manager');
+        return strtolower(trim((string) ($cfg['ONEPASSWORD_SECRET_INJECTION'] ?? 'true'))) !== 'false';
     }
 
     /**

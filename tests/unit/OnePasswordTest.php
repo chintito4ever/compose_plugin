@@ -370,7 +370,7 @@ class OnePasswordTest extends TestCase
     }
 
     // ===========================================
-    // Phase 1 gate and command builder
+    // Gate and command builder
     // ===========================================
 
     public function testGateBlocksManagedProjectsAndAllowsOrdinary(): void
@@ -382,6 +382,7 @@ class OnePasswordTest extends TestCase
         $gate = \OnePassword::deploymentGate($this->detect('sitespeedio'));
         $this->assertFalse($gate['allowed']);
         $this->assertTrue($gate['managed']);
+        $this->assertSame('unavailable', $gate['reason']);
     }
 
     public function testCommandBuilderReportsOnePasswordOnlyForContainerCreatingActions(): void
@@ -457,6 +458,130 @@ class OnePasswordTest extends TestCase
         $this->assertIsArray($payload);
         $this->assertSame('onepassword', $payload['error']);
         $this->assertSame(['sitespeedio'], $payload['stacks']);
+    }
+
+    // ===========================================
+    // Phase 2: secret-aware deployment gate
+    // ===========================================
+
+    public function testGateFollowsLockStateForSupportedProject(): void
+    {
+        $dir = $this->createStack('sitespeedio', ['compose.yaml' => self::SITESPEED_COMPOSE, '.env' => self::SITESPEED_ENV]);
+        $detection = $this->detect('sitespeedio');
+
+        $gate = \OnePassword::deploymentGate($detection, true);
+        $this->assertFalse($gate['allowed']);
+        $this->assertSame('unavailable', $gate['reason']);
+        $this->assertStringContainsString('op-secure', (string) $gate['message']);
+
+        $this->installFakeCli();
+        $gate = \OnePassword::deploymentGate($detection, true);
+        $this->assertFalse($gate['allowed']);
+        $this->assertSame('locked', $gate['reason']);
+        $this->assertSame(\OnePassword::LOCKED_MESSAGE, $gate['message']);
+        $this->assertStringContainsString('op-unlock', (string) $gate['message']);
+
+        $this->unlock();
+        $gate = \OnePassword::deploymentGate($detection, true);
+        $this->assertTrue($gate['allowed']);
+        $this->assertTrue($gate['managed']);
+        $this->assertSame("$dir/.env", $gate['envFile']);
+    }
+
+    public function testGateBlocksWhenOpStatusFails(): void
+    {
+        $this->createStack('sitespeedio', ['compose.yaml' => self::SITESPEED_COMPOSE, '.env' => self::SITESPEED_ENV]);
+        $this->installFakeCli(true);
+        $this->unlock();
+        $this->statusExit = 3;
+
+        $gate = \OnePassword::deploymentGate($this->detect('sitespeedio'), true);
+        $this->assertFalse($gate['allowed']);
+        $this->assertSame('error', $gate['reason']);
+    }
+
+    public function testGateRespectsDisabledSetting(): void
+    {
+        $this->createStack('sitespeedio', ['compose.yaml' => self::SITESPEED_COMPOSE, '.env' => self::SITESPEED_ENV]);
+        $this->installFakeCli();
+        $this->unlock();
+        FunctionMocks::setPluginConfig('compose.manager', ['PROJECTS_FOLDER' => $this->root, 'ONEPASSWORD_SECRET_INJECTION' => 'false']);
+
+        $this->assertFalse(\OnePassword::injectionEnabled());
+        $gate = \OnePassword::deploymentGate($this->detect('sitespeedio'));
+        $this->assertFalse($gate['allowed']);
+        $this->assertSame('not_enabled', $gate['reason']);
+
+        FunctionMocks::setPluginConfig('compose.manager', ['PROJECTS_FOLDER' => $this->root]);
+        $this->assertTrue(\OnePassword::injectionEnabled());
+        $this->assertTrue(\OnePassword::deploymentGate($this->detect('sitespeedio'))['allowed']);
+    }
+
+    public function testGateNeverAllowsUnsupportedConfigEvenWhenUnlocked(): void
+    {
+        $this->createStack('envfile-dotenv', [
+            'compose.yaml' => "services:\n  app:\n    image: x\n    env_file: .env\n",
+            '.env' => "DB_PASSWORD=op://Vault/App/DB_PASSWORD\n",
+        ]);
+        $this->installFakeCli();
+        $this->unlock();
+        $gate = \OnePassword::deploymentGate($this->detect('envfile-dotenv'), true);
+        $this->assertFalse($gate['allowed']);
+        $this->assertSame('unsupported', $gate['reason']);
+    }
+
+    public function testInterpolationInsideManagedEnvFileIsUnsupported(): void
+    {
+        $this->createStack('interp', [
+            'compose.yaml' => "services:\n  app:\n    image: x\n",
+            '.env' => "DB_PASSWORD=op://Vault/App/DB_PASSWORD\nDB_URL=postgres://app:\${DB_PASSWORD}@db/app\nLITERAL='\${NOT_EXPANDED}'\n",
+        ]);
+        $detection = $this->detect('interp');
+        $this->assertFalse($detection->isDeployable());
+        $this->assertStringContainsString('DB_URL', (string) $detection->getBlockReason());
+        $this->assertStringNotContainsString('LITERAL', (string) $detection->getBlockReason());
+    }
+
+    public function testEchoComposeCommandPassesEnvFileToComposeShWhenUnlocked(): void
+    {
+        $managed = $this->createStack('sitespeedio', ['compose.yaml' => self::SITESPEED_COMPOSE, '.env' => self::SITESPEED_ENV]);
+        $ordinary = $this->createStack('paperless', ['compose.yaml' => "services:\n  app:\n    image: x\n"]);
+        $this->installFakeCli();
+        $this->unlock();
+        $this->startArray();
+
+        $before = glob('/tmp/compose_multi_*.sh') ?: [];
+        ob_start();
+        echoComposeCommandMultiple('update', ['paths' => [$managed, $ordinary]]);
+        $output = (string) ob_get_clean();
+        $this->assertStringContainsString('ShowTtyd.php', $output);
+
+        $created = array_values(array_diff(glob('/tmp/compose_multi_*.sh') ?: [], $before));
+        $this->assertCount(1, $created);
+        $script = (string) file_get_contents($created[0]);
+        @unlink($created[0]);
+
+        $lines = array_values(array_filter(explode("\n", $script), static fn(string $l): bool => str_contains($l, 'compose.sh')));
+        $this->assertCount(2, $lines);
+        $this->assertStringContainsString("'--op-env-file' '$managed/.env'", $lines[0]);
+        $this->assertStringNotContainsString('--op-', $lines[1]);
+        // The token is never part of a command line.
+        $this->assertStringNotContainsString(self::FAKE_TOKEN, $script);
+    }
+
+    public function testEchoComposeCommandReturnsLockedMessage(): void
+    {
+        $dir = $this->createStack('sitespeedio', ['compose.yaml' => self::SITESPEED_COMPOSE, '.env' => self::SITESPEED_ENV]);
+        $this->installFakeCli();
+        $this->startArray();
+
+        $_POST = ['path' => $dir, 'profile' => ''];
+        ob_start();
+        echoComposeCommand('update');
+        $payload = json_decode((string) ob_get_clean(), true);
+        $this->assertSame('onepassword', $payload['error']);
+        $this->assertSame('locked', $payload['reason']);
+        $this->assertSame(\OnePassword::LOCKED_MESSAGE, $payload['message']);
     }
 
     // ===========================================
